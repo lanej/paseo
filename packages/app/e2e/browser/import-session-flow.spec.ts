@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
-import { copyFile, mkdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { TestInfo } from "@playwright/test";
-import { test, type Page } from "../support/fixtures";
+import { test, expect, type Page } from "../support/fixtures";
 import { ImportSessionFlow } from "../support/helpers/import-session";
 import {
   connectNewWorkspaceDaemonClient,
@@ -13,10 +13,6 @@ import {
 } from "../support/helpers/new-workspace";
 import { createTempDirectory, createTempGitRepo } from "../support/helpers/workspace";
 
-const SCREENSHOT_DIRECTORY = path.join(
-  process.env.HOME ?? tmpdir(),
-  ".paseo/plans/import-session-ux",
-);
 const claudeConfigDirectory = mkdtempSync(path.join(tmpdir(), "paseo-import-flow-claude-"));
 const brokenProvider = "broken-acp";
 
@@ -59,7 +55,6 @@ let client: Awaited<ReturnType<typeof connectNewWorkspaceDaemonClient>>;
 test.setTimeout(120_000);
 
 test.beforeAll(async () => {
-  await mkdir(SCREENSHOT_DIRECTORY, { recursive: true });
   const repo = await createTempGitRepo("isf-", {
     originUrl: "https://github.com/paseo-e2e/import-session-fixture.git",
   });
@@ -120,6 +115,57 @@ test.afterAll(async () => {
   await scenario?.repoCleanup().catch(() => undefined);
   await scenario?.unrelatedCleanup().catch(() => undefined);
   await rm(claudeConfigDirectory, { recursive: true, force: true });
+});
+
+test("filters cached sessions before searching a persistent miss", async ({ page }, testInfo) => {
+  const requests: Array<{ query: string; providers: string }> = [];
+  page.on("websocket", (socket) =>
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const frame: { message?: { type?: string; query?: string; providers?: string[] } } =
+        JSON.parse(payload);
+      if (frame.message?.type === "fetch_recent_provider_sessions_request")
+        requests.push({
+          query: frame.message.query ?? "",
+          providers: (frame.message.providers ?? []).join(","),
+        });
+    }),
+  );
+  const flow = new ImportSessionFlow(page);
+  await flow.openWorkspace(scenario.project.workspaceId, { width: 390, height: 844 });
+  await flow.revealMobileEntryPoint();
+  await flow.openGlobally();
+  await flow.expectRows({
+    first: [scenario.importSessionId, "fixture-worktree", "fixture-unrelated"],
+  });
+  await flow.expectProviderError("Broken ACP");
+  expect(requests.length).toBeGreaterThan(0);
+  const initialRequests = [...requests];
+  await page.clock.install();
+  await flow.search("invoice");
+  await page.clock.runFor(600);
+  expect(requests).toEqual(initialRequests);
+  await page.getByTestId("import-session-search").fill("no-such-session");
+  await page.clock.runFor(200);
+  expect(requests).toEqual(initialRequests);
+  await flow.search("invoice");
+  await page.clock.runFor(600);
+  expect(requests).toEqual(initialRequests);
+  await page.getByTestId("import-session-search").fill("fixture item 20");
+  await page.clock.runFor(450);
+  await expect(page.getByText("Root session 20", { exact: true })).toBeVisible();
+  expect(
+    requests
+      .filter((request) => request.query === "fixture item 20")
+      .map((request) => request.providers)
+      .sort(),
+  ).toEqual([...new Set(initialRequests.map((request) => request.providers))].sort());
+  await page.getByTestId("import-session-search").fill("item 20");
+  await page.clock.runFor(600);
+  expect(requests.filter((request) => request.query === "item 20")).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath("cached-session-search.png") });
+  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page.getByTestId("import-session-sheet")).toHaveCount(0);
 });
 
 test("captures the compact import-session journey", async ({ page }, testInfo) => {
@@ -217,7 +263,6 @@ test("captures the desktop import sheet and command-center entry", async ({ page
 async function capture(page: Page, testInfo: TestInfo, name: string): Promise<void> {
   const outputPath = testInfo.outputPath(name);
   await page.screenshot({ path: outputPath, fullPage: true });
-  await copyFile(outputPath, path.join(SCREENSHOT_DIRECTORY, name));
 }
 
 async function seedClaudeSessions(input: {

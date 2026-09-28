@@ -494,7 +494,7 @@ describe("ImportSessionSheet", () => {
     screen.getByText("Make the rows readable and provider opaque");
   });
 
-  it("keeps cached rows visible and revalidates when reopened", async () => {
+  it("reuses fresh cached rows when reopened and refreshes on demand", async () => {
     const fetchRecentProviderSessions = vi.fn(async () => ({
       requestId: "recent-provider-sessions",
       entries: [
@@ -543,6 +543,8 @@ describe("ImportSessionSheet", () => {
     rerender(<TestSheet visible />);
 
     await screen.findByText("Cached importable session");
+    expect(fetchRecentProviderSessions).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("import-session-refresh"));
     await waitFor(() => {
       expect(fetchRecentProviderSessions).toHaveBeenCalledWith({
         cwd: "/repo/paseo",
